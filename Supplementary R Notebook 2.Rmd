@@ -1,0 +1,388 @@
+---
+title: "CITEseq data processing"
+output: html_notebook
+date: 'Created on: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+In this example, we are using a mouse glioblastoma CITEseq dataset.This dataset contains CD45+ sorted cells from a GL261 glioblastoma tumor of wild type and CCR2 knockout mice (WT4 and KO4).You can download the expression matrix [here](https://www.brainimmuneatlas.org/data_files/toDownload/filtered_feature_bc_matrix_MouseGBMciteSeq.zip).
+
+```{r}
+suppressPackageStartupMessages({
+ library(Seurat)
+ library(dplyr)
+ library(VennDiagram)
+ library(harmony)
+ library(clustree)
+ library(cowplot)
+ library(Matrix)
+})
+```
+
+Set the working directory
+```{r setup}
+knitr::opts_knit$set(root.dir = "path/to/directory")
+```
+
+### 1) LOADING THE INPUT DATA
+Load the seurat object with the preprocessed RNA data
+```{r}
+#### You can load the output from the notebook "scRNAseq_RNA_processing.Rmd"
+seur_RNA=readRDS( "Citeseq_mouse_GBM.seuratObj.rds")
+```
+
+We use the Read10X function to read in the raw (unfiltered) expression matrix from the Cell Ranger output, which returns a list of two matrices: "Gene Expression" and "Antibody Capture". We load the "Antibody Capture" matrix.
+```{r}
+seur_ADT<-CreateSeuratObject(counts = Read10X("data/Citeseq_mouse_GBM/raw_feature_bc_matrix")[["Antibody Capture"]],assay = "ADT")
+```
+
+Identify the different samples based on the cell barcode names
+```{r}
+head(colnames(seur_ADT))
+```
+```{r}
+seur_ADT$sample<-sapply(strsplit(colnames(seur_ADT), "-"), "[[",2)
+table(seur_ADT$sample)
+```
+```{r}
+seur_ADT$sample<-plyr::mapvalues(seur_ADT$sample, from=1:2, to=c("KO1","WT1"))
+```
+
+Alternatively, if starting from the individual expression matrices for each sample,we load them and then concatenate them together using the Seurat function "merge":
+```{r}
+# sample_folder_names=c("KO1","WT1")
+### sample_folder_names - a vector with the names of the folders that contain the Cellranger outputs for each sample
+# seur_ADT=list()
+# for ( i in c(sample_folder_names)) {  
+#   seur_ADT[[i]]<-CreateSeuratObject(counts = Read10X(paste0(i,"/raw_feature_bc_matrix"))[["Antibody Capture"]],assay = "ADT" )
+#   seur_ADT[[i]]$sample
+# }
+# seur_ADT<-merge(seur_ADT[[1]],seur_ADT[2:length(seur_ADT)])
+```
+
+Remove cell barcodes with zero counts for all antibodies
+```{r}
+cat("Number of barcodes before filtering:",ncol(seur_ADT))
+seur_ADT<-seur_ADT[, seur_ADT$nCount_ADT >0]  ### Remove barcodes with 0 counts
+cat("\nNumber of barcodes after filtering:",ncol(seur_ADT))
+```
+
+Remove antibodies with zero counts for all cells
+```{r}
+feature.nUMI<-Matrix::rowSums(GetAssayData(seur_ADT,slot="counts")) ##### Calculate number of UMI counts per feature
+cat("ADT features with 0 counts:",names(feature.nUMI)[feature.nUMI==0])
+cat("\nNumber of features before filtering:",nrow(seur_ADT))
+seur_ADT<-seur_ADT[feature.nUMI>0,] ### Remove antobodies with 0 counts
+cat("\nNumber of features after filtering:",nrow(seur_ADT))
+```
+
+
+### 2) PERFORM ASINH_GEOM NORMALIZATION  
+```{r}
+###### Function for ASINH_GEOM normalisation ######
+ASINH_GEOM_normalisation<-function(ADT_raw_matrix){
+ ##### Find the total number of antibodies
+ num.Abs <- length(rownames(ADT_raw_matrix)) 
+
+ ##### Calculate modified geometric mean counts per antibody in asinh scale
+ geo.means <- unlist(lapply(1:num.Abs,function(x){
+    sinh(mean(asinh(as.matrix(ADT_raw_matrix[x,]))))  
+ })) 
+
+ ##### Perform ASINH_GEOM normalisation
+ ADT_norm_matrix <- ADT_raw_matrix/geo.means 
+ ADT_norm_matrix<- asinh(ADT_norm_matrix)
+ ADT_norm_matrix
+}
+```
+```{r}
+seur_ADT<-SetAssayData(object =seur_ADT,slot="data",new.data = ASINH_GEOM_normalisation(GetAssayData(seur_ADT,slot="counts")), assay="ADT")
+```
+
+### 3) QC PLOTS
+#### Sample profile plot - the distribution of the maximum UMI count per cell (the normalised UMI counts of the antibody with the highest expression per cell)
+The y axis show the number of cells with maximum UMI count larger than the respective x-value, and the x -axis show the maximum UMI count values. The sample profile plot can be compared between samples to reveal those with abnormal profile
+
+```{r, fig.width = 4,fig.height=4}
+max_UMI_counts<-  data.frame(max.counts=as.vector(apply(GetAssayData(seur_ADT,slot="data"),2,max,na.rm=TRUE)))
+rownames(max_UMI_counts)=colnames(GetAssayData(seur_ADT,slot="data"))
+max_UMI_counts$sample=seur_ADT$sample[rownames(max_UMI_counts)]
+A.tab.x=list()
+A.tab.y=list()
+for ( i in  unique(max_UMI_counts$sample)) {
+  A.tab.x[[i]] <- sort(unique(max_UMI_counts[max_UMI_counts$sample==i,"max.counts"]))
+  A.tab.y[[i]] <- unlist(lapply(A.tab.x[[i]] ,function(x){
+    length(which(max_UMI_counts[max_UMI_counts$sample==i,"max.counts"]  >= x))
+  }))
+plot(A.tab.x[[i]],A.tab.y[[i]],xlab="max(UMI)",ylab="cell count >= UMI",main=i)
+}
+```
+
+#### - Compare the overlap of cells remaining after applying filtering with different thresholds on the ADT data with the cells that passed the quality filtering of the RNA data for the same sample
+```{r}
+#### Define a function that filters the ADT matrix below a specified number of cells, based on the maximum UMI count per cell
+get_input <- function(seurObj,assay.use="ADT",sample.name,numcells,tab.y=A.tab.y,max_UMI=max_UMI_counts,tab.x=A.tab.x,data_norm=ADT_norm){
+  index_K_cells <- which(tab.y[[sample.name]] <= numcells)[1]
+  input_clean <- which(max_UMI_counts[max_UMI_counts$sample==sample.name,"max.counts"]  >= tab.x[[sample.name]][index_K_cells])
+  cellnames_reduced <- rownames(max_UMI_counts[max_UMI_counts$sample==sample.name,])[input_clean]
+  cellnames_reduced
+}
+#### Define a function that plots a Venn Diagram of the overlap between cells passing the filtering of the ADT data
+####vs those that pass the filteirng of the RNA data
+RNA_ADT_venndiagram <- function(ADT_seur,RNA_seur,sample.use,cells.input,tab.x=A.tab.x,tab.y=A.tab.y,max_UMI=max_UMI_counts){
+  ### cells.input - threshold for maximum number of cells after filtering
+  ADT_barcodes_filt<-get_input(seurObj=ADT_seur,sample.name=sample.use,numcells=cells.input)
+  RNA_barcodes<-colnames(RNA_seur[,WhichCells(RNA_seur,expression=sample==sample.use)])
+  perc<-(length(intersect(ADT_barcodes_filt,RNA_barcodes))/length(RNA_barcodes))*100
+  v<-venn.diagram(
+      list (ADT=ADT_barcodes_filt,
+          RNA=RNA_barcodes
+        ),
+    main = paste0(sample.use,": Threshold: <=", cells.input, " cells - ",round(perc,1),"% overlap with RNA 'true' cells"),
+    filename=NULL,alpha = c( 0.5,0.5),cat.pos=c(270,100),margin=0.05,ext.text=T, fill = c("lightblue","orange")
+   )
+  grid.newpage()
+  grid.draw(v)
+}
+```
+
+#### Plot the Venn Diagram - we filter the ADT data to the expected cell number or higher
+```{r}
+table(seur_RNA$sample)
+```
+
+
+```{r, fig.height = 3, fig.width = 8 }
+cutoffs=c(17000,15000) ### Here, we give the number of cells,up to which we want to filter each sample
+for ( i in  1:length(unique(seur_ADT$sample))) {
+RNA_ADT_venndiagram(seur_ADT,seur_RNA,sample.use=unique(seur_ADT$sample)[i],cells.input=cutoffs[i])
+}
+```
+Overlap of 70-90% is within the exprected range. 
+
+
+### 4) FILTER CELLS
+
+#### Filter out the ADT barcodes that don't overlap with the RNA filtered cells
+```{r}
+seur_ADT_filtered<-seur_ADT[,intersect(colnames(seur_RNA),colnames(seur_ADT))]
+cat("raw ADT:",ncol(seur_ADT),"cells")
+cat("\nintersect with RNA QC filtered: ",ncol(seur_ADT_filtered),"cells")
+```
+
+#### We can also remove cells based on a maximum ADT counts cutoff, but here we will keep these cells for now, as we can always remove them at a later stage.
+```{r}
+cellnames_filtered<-c()
+for ( i in   1:length(unique(seur_ADT$sample))) {
+  cellnames_filtered<-c(cellnames_filtered,get_input(seurObj=seur_ADT,sample.name=unique(seur_ADT$sample)[i],numcells=cutoffs[i]))
+}
+seur_ADT_filtered$max_ADT_outliers=!colnames(seur_ADT_filtered) %in% cellnames_filtered
+cat("maxADT outliers:") 
+table(seur_ADT_filtered$max_ADT_outliers) 
+```
+
+
+Remove the maxADT outliers
+```{r}
+#seur_ADT_filtered=seur_ADT_filtered[,WhichCells(seur_ADT_filtered,expression=max_ADT_outliers==F)]
+```
+
+
+### 5) COMBINE THE ADT AND RNA SEURAT OBJECTS
+#### Filter the RNA seurat object to the cells that overlap with the filtered ADT matrix (if necessary)
+```{r}
+overlap.cells=intersect(colnames(seur_RNA),colnames(seur_ADT_filtered))
+cat("Cells to be removed:",ncol(seur_RNA)-length(overlap.cells)) 
+seur_combined<-seur_RNA[,WhichCells(seur_RNA, cells=overlap.cells)]
+seur_combined$max_ADT_outliers=seur_ADT_filtered$max_ADT_outliers[colnames(seur_combined)]
+```
+
+Which cell types are the maxADT outlier cells
+```{r}
+seur_combined$celltype=Idents(seur_combined)
+seur_combined@meta.data %>% dplyr::group_by(celltype,max_ADT_outliers)%>% dplyr::summarise(count=dplyr::n()) %>% suppressMessages()%>% tidyr::spread(max_ADT_outliers, count)%>% dplyr::rename_with(~plyr::mapvalues(.x,from=c("FALSE","TRUE"), to=c("non-outliers", "max_ADT_outliers")))%>%arrange(desc(max_ADT_outliers))
+```
+
+
+
+#### Add the ADT data to the RNA seurat object
+```{r }
+seur_ADT_filtered<-seur_ADT_filtered[,colnames(seur_combined)]
+seur_combined[["ADT"]]<-CreateAssayObject(counts =GetAssayData(seur_ADT_filtered, assay="ADT", slot="counts")) 
+seur_combined<-SetAssayData(object =seur_combined,slot="data", assay="ADT",new.data = ASINH_GEOM_normalisation(GetAssayData(seur_combined,slot="counts", assay="ADT")))
+```
+
+### 6) EXPLORE THE ADT DATA
+Check the names of the antibodies:
+```{r}
+rownames(seur_combined[["ADT"]])[order(rownames(seur_combined[["ADT"]]))]
+```
+
+####  Visualise the antibodies through density plots
+```{r }
+data<-as.data.frame(t( as.matrix(GetAssayData(seur_combined, slot="data", assay="ADT"))))
+data$sample=seur_combined$sample[rownames(data)]
+data_density<-reshape2::melt(data)%>%suppressMessages() 
+colnames(data_density)[colnames(data_density)=="variable"]<-"protein" 
+```
+```{r , fig.height = 4, fig.width = 8}
+features=c( "CD11b" , "CD79b"  ,"CD4"  , "CD8a")
+ggplot(data_density[data_density$protein %in% features,],  aes(x=value, fill=sample,color=sample))+ 
+  geom_density(alpha=0.2)+
+  facet_wrap(~protein)+xlab("ASINH_GEOM counts")+
+  geom_rug()+theme_classic()
+```
+#### Biaxial plots
+```{r , fig.height = 6, fig.width = 7}
+x.axis<-"CD8a"
+y.axis<-"CD11b"
+temp=data[,c(x.axis,y.axis)]
+temp=temp[temp>0,] 
+ggplot(temp) +
+   geom_point(mapping= aes_string( x = x.axis, y = y.axis),size=.6) +
+      stat_density_2d( mapping = aes_string( x = x.axis, y = y.axis, fill = "..level.." ),
+                        alpha=0.4,geom = "polygon" ,show.legend = F) +
+      scale_fill_viridis()+
+  xlim( -1, NA) + ylim( -1, NA)+
+ theme_classic()+
+  #theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+ggtitle("Arcsinh geommean counts")
+```
+
+### 7) IDENTIFY CELL SURFACE MARKERS FOR RNA-BASED CLUSTERS
+We can identify protein makers for specific clusters based on Wilcoxon Rank Sum differential expression test
+```{r}
+ADT_markers= FindAllMarkers(seur_combined, min.cells.group=2, assay = "ADT",verbose=F)
+```
+
+#### We can visualise the expression of the top protein markers for each cluster in a heatmap
+Scale ADT data
+```{r }
+seur_combined<-ScaleData(seur_combined, assay = "ADT", verbose = F)
+```
+```{r }
+features.use=ADT_markers%>%filter(avg_logFC>0)%>% group_by(cluster)%>%top_n(n=-4,wt=p_val_adj)%>%pull(gene)
+length(features.use)
+```
+
+```{r , fig.height =13, fig.width =12}
+features.use=ADT_markers%>%filter(avg_logFC>0)%>% group_by(cluster)%>%top_n(n=-4,wt=p_val_adj)
+features.use=features.use$gene
+seur_combined<-ScaleData(seur_combined, assay = "ADT", verbose = F)
+DoHeatmap(seur_combined, features = features.use, assay = "ADT", angle = 90, label =T, size=4) +
+  scale_fill_gradient2(low = "blue", mid = "white",high = "red")+
+  theme(legend.position = "bottom")%>%suppressMessages()
+```
+
+### 8) UMAP BASED ON THE ADT DATA
+
+For calculating the UMAP projections, antibodies with low or diffuse expression across the cells can be filtered out to reduce the effect of technical noise. We can do that by inspecting the antibody expression on density plots and UMAP plots.
+
+```{r }
+#### Define a function that visualizes the ADT and RNA expression side-by-side
+protein_gene_Featureplot=function(seur, protein,gene, reduction.use="umap"){
+p1<-FeaturePlot(object = seur, paste0("adt_",protein), slot = "data" ,cols=c("grey","blue"),reduction = reduction.use,
+           min.cutoff = "q20", max.cutoff = "q98")+ggtitle(paste0(protein, " protein"))
+p2<-FeaturePlot(object = seur, gene,reduction =reduction.use ,
+            cols = c("grey", "red"))+ggtitle(paste0(gene, " gene"))
+print(plot_grid(p1,p2, ncol=2))
+}
+```
+
+For example, we are going to exclude from running UMAP CD135 (encoded by Flt3, a DC marker), Notch1 and CD83 antibodies:
+```{r , fig.height = 4.5, fig.width =10}
+protein_gene_Featureplot(seur_combined,protein="CD135", gene="Flt3")
+```
+```{r , fig.height = 4.5, fig.width =10}
+protein_gene_Featureplot(seur_combined,protein="Notch1.1", gene="Notch1")
+```
+```{r , fig.height = 4.5, fig.width =10,}
+protein_gene_Featureplot(seur_combined,protein="CD83", gene="Cd83")
+```
+```{r , fig.height = 5, fig.width = 9}
+DimPlot(object = seur_combined,label=T, repel=T)+
+  ggtitle("Cell annotation: RNA UMAP")
+```
+
+```{r , fig.height = 2, fig.width = 12}
+features=c( "CD135" , "Notch1.1","CD83" )
+ggplot(data_density[data_density$protein %in% features,],  aes(x=value, fill=sample,color=sample))+ 
+  geom_density(alpha=0.2)+
+  facet_wrap(~protein)+xlab("ASINH_GEOM counts")+
+  geom_rug()+theme_classic()
+```
+
+Tag all antibodies with low and non-specific expression in the dataset under study:
+```{r }
+lowly.expr.ADT<-c("CD105","CD122","CD124","CD135","CD137L", "CD140a", "CD15","CD152","CD163", "CD183", "CD185", "CD192", "CD193", "CD196", "CD197", "CD20", "CD207", "CD23", "CD28", "CD300c-d", "CD314", "CD335", "CD34","CD370", "CD3e", "CD62E",  "CD62P" ,"CD68","CD83", "CLEC4F", "CXCR4", "DLL1", "DoprD4", "DR3","ERK1", "ESAM", "GABRB3", "IgG-Hamster",  "IgG1-Mouse-k", "IgG2a-Mouse-k", "IgG2b-Mouse-k", "IgG2a-Rat-k", "IgG2b-Rat-k", "IgG2c-Rat-k", "IgG1-Rat-k",  "IgG1-Rat-l", "IgM","IRF4", "KCC2","MAdCAM1", "Notch1.1", "P2RY12", "Panendothelial", "RORg", "TCRb-V5" , "TCRb-V8", "TCRg-V1.1" , "TCRg-V2" ,  "TCRg-V3"  ,  "TCRgd", "TER119", "VSIG4","CD115", "CD127", "CD195",  "CD204", "CD279", "CD79b", "CD93")
+meta.feature.data=data.frame(protein=rownames(seur_combined[["ADT"]]))
+rownames(meta.feature.data)=meta.feature.data$protein
+meta.feature.data$lowly_expressed=meta.feature.data$protein %in% lowly.expr.ADT
+seur_combined[["ADT"]]<-AddMetaData(seur_combined[["ADT"]],  meta.feature.data$lowly_expressed, col.name = "lowly_expressed")
+cat("Antibodies to be excluded from clustering and UMAP:")
+table(seur_combined[["ADT"]]@meta.features$lowly_expressed)
+```
+
+#### Run UMAP, using the scaled ARSINH GEOM transformed values (excluding lowly expressed/noisy antibodies)
+```{r }
+features.use<-rownames(seur_combined[["ADT"]])[!seur_combined[["ADT"]]@meta.features$lowly_expressed]
+#### Run UMAP using the scaled ADT values
+umap<- RunUMAP(seur_combined, assay = "ADT", features = features.use, reduction.key = "adtUMAP_", slot="scale.data", verbose=F)
+seur_combined[["adtUMAP"]] <- CreateDimReducObject(embeddings = Embeddings(umap, reduction = "umap"), key = "adtUMAP_", assay ="ADT")
+rm(umap)
+```
+
+#### Visualise the ADT UMAP plot, coloured by sample to check for batch effects
+```{r , fig.height = 6, fig.width = 8}
+DimPlot(seur_combined, reduction = "adtUMAP",group.by = "sample")+
+  ggtitle(paste("Samples: ADT UMAP"))
+```
+#### Visualise the ADT UMAP plot, coloured by cell type annotation
+```{r , fig.height = 6, fig.width = 10}
+DimPlot(seur_combined, reduction = "adtUMAP",label=T,repel=T)+
+  ggtitle(paste("Cell type: ADT UMAP"))
+```
+### 9) BATCH CORRECTION AND UMAP BASED ON THE ADT DATA
+If needed we can apply batch correction with Harmony on the ADT matrix, prior to running UMAP
+```{r , fig.height = 4, fig.width = 4}
+#### Select a value for theta - diversity clustering penalty parameter.
+#### Default theta=2. Larger values of theta result in stronger integration, but can lead to over-correction)
+theta.use<-0
+#### Run Harmony on the normalized ADT count matrix
+harmony_embeddings <- HarmonyMatrix(t(as.matrix(GetAssayData(seur_combined, assay = "ADT",slot="data"))),
+                      meta_data=seur_combined$sample,  do_pca=FALSE,theta = theta.use,verbose=F)
+#### Run UMAP on the harmony-corrected count matrix
+umap<-CreateSeuratObject(counts=GetAssayData(seur_combined, assay = "ADT",slot="counts"), assay="ADT")
+umap<-SetAssayData(object =umap,slot="data",new.data =t(harmony_embeddings), assay="ADT")
+umap<-ScaleData(umap, assay="ADT",verbose = F)
+umap<- RunUMAP(umap, assay = "ADT", features = features.use, 
+               reduction.key = paste0("adtHarmonyTheta",theta.use,"Umap_"),  
+               slot="scale.data",verbose=F)
+seur_combined[[paste0("adtHarmonyTheta",theta.use,"Umap")]] <- 
+          CreateDimReducObject(embeddings = Embeddings(umap, reduction = "umap"),  
+                               key = paste0("adtHarmonyTheta",theta.use,"Umap_"),  
+                               assay ="ADT")
+rm(umap)
+```
+
+#### Visualise the ADT UMAP plot, coloured by sample to check if the  batch effects were resolved
+```{r , fig.height = 6, fig.width = 8}
+DimPlot(seur_combined, reduction = paste0("adtHarmonyTheta",theta.use,"Umap"),group.by = "sample")+
+  ggtitle(paste("Samples: ADT UMAP Harmony theta=",theta.use))
+```
+#### Visualise the ADT UMAP plot, coloured by cell type annotation
+```{r , fig.height = 6, fig.width = 10}
+DimPlot(seur_combined, reduction = paste0("adtHarmonyTheta",theta.use,"Umap"),label=T,repel=T)+
+  ggtitle( paste0("Cell type: ADT UMAP Harmony theta=",theta.use))
+```
+
+As the the samples already show good mixing before batch correction, and the library preparation was done on the same day for both samples, for this dataset batch correction is not necessary
+
+
+##### Save object
+```{r}
+saveRDS(seur_combined, file="Citeseq_human_GBM.seuratObj_combined.rds")
+```
+
+```{r}
+sessionInfo()
+```

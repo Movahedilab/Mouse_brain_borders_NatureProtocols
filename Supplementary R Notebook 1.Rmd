@@ -1,0 +1,630 @@
+---
+title: "Single-cell RNA sequencing data processing"
+output: html_notebook
+date: 'Created on: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+In this example, we are using a CITEseq dataset of mouse glioblastoma model.This dataset contains CD45+ sorted cells from a GL261 glioblastoma tumor of wild type and CCR2 knockout mice (WT4 and KO4).You can download the expression matrix [here](https://www.brainimmuneatlas.org/data_files/toDownload/filtered_feature_bc_matrix_MouseGBMciteSeq.zip).
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(scater)
+  library(dplyr)
+  library(VennDiagram)
+  library(mvoutlier)
+  library(harmony)
+  library(clustree)
+  library(cowplot)
+  library(scDblFinder)
+  library(ggplot2)
+  library(ggrepel)
+})
+```
+
+Set the working directory
+```{r setup}
+knitr::opts_knit$set(root.dir = "path/to/directory")
+```
+
+### 1) LOADING THE INPUT DATA
+We use the Read10X function to read in the expresion matrix from the Cell Ranger output, which returns a list of two matrices: "Gene Expression" and "Antibody Capture". We load the "Gene Expression" matrix into a Seurat object.
+```{r}
+seur<-CreateSeuratObject(counts = Read10X(paste0("data/Citeseq_mouse_GBM/filtered_feature_bc_matrix"))[["Gene Expression"]] )
+### For single-cell RNA sequencing experiment wihout feature barcoding library, use:
+### seur<-CreateSeuratObject(counts = Read10X(paste0("path/to/filtered_feature_bc_matrix")) )
+```
+
+Identify the different samples based on the cell barcode names
+```{r}
+head(colnames(seur))
+```
+```{r}
+seur$sample<-sapply(strsplit(colnames(seur), "-"), "[[",2)
+table(seur$sample)
+```
+```{r}
+seur$sample<-plyr::mapvalues(seur$sample, from=1:2, to=c("KO1","WT1"))
+```
+Alternatively, if starting from the individual expression matrices for each sample,we can load them as a list of seurat objects and then merge them using the Seurat function "merge":
+```{r}
+# sample_folder_names=c("KO1","WT1")
+### sample_folder_names - a vector with the names of the folders that contain the Cellranger outputs for each sample
+# seur=list()
+# for ( i in c(sample_folder_names)) {  
+#   seur[[i]]<-CreateSeuratObject(counts = Read10X(paste0(i,"/filtered_feature_bc_matrix"))[["Gene Expression"]] )
+#   seur[[i]]$sample=i
+# }
+# seur<-merge(seur[[1]],seur[2:length(seur)])
+```
+
+
+
+### 2) QC: CELLS
+#### 2.1)  Find outliers for total UMI counts, number of genes and percent mitohondrial genes per cell. 
+Outliers are determined based on the median absolute deviation (MAD). The goal is to remove the long tail before/after the peak in the sitribution of the QC metric. It is possible to modify the nmads parameter (minimum number of MADs away from median, required for a value to be called an outlier), or to set the threshold manually (e.g. remove all cells with percent mitochondrial genes above 40). 
+
+Calculate % mitochondrial genes per cell
+```{r}
+seur[["perc.mito"]] <- PercentageFeatureSet(seur, pattern = "^mt-") ### We include all genes starting with "mt-" for calculating this QC satistic. Depending on the organism, the search pattern might need to be modified, e.g. into "MT-" for human
+summary(seur$perc.mito)
+```
+
+
+#### - UMI counts per cell
+```{r}
+outliers=c()
+for ( i in unique(seur$sample)){
+  outliers=c(outliers, 
+             scater::isOutlier(seur$nCount_RNA[seur$sample==i], nmads=3, type="lower", log=TRUE)
+             )
+}
+seur$nUMI.outlier.low <- outliers[colnames(seur)]
+cat("Outliers:",sum(seur$nUMI.outlier.low))
+```
+
+Create histograms
+```{r , fig.height = 3.5, fig.width = 10}
+for ( i in unique(seur$sample)){
+  hist(seur$nCount_RNA[seur$sample==i],
+        breaks = 100,xlab="nCount_RNA",
+        main=paste0("Total UMI counts per cell: ",i))
+  if(sum(seur$sample==i & seur$nUMI.outlier.low)!=0)
+    abline(v = max(seur$nCount_RNA[seur$sample==i & seur$nUMI.outlier.low]), col = "red")
+}
+```
+Create violin plots 
+```{r , fig.height = 3.5, fig.width = 10}
+for ( i in unique(seur$sample)){
+ print(ggplot(as.data.frame(seur[[]])[seur$sample==i,], aes(1, nCount_RNA)) + 
+    geom_violin(fill="gray80") +theme_classic()+ theme(axis.title.x = element_blank())+
+    geom_jitter(height = 0, width = 0.3, aes(col=nUMI.outlier.low)) +
+    scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("Total UMI counts per cell: ",i)))
+}
+```
+
+
+#### - Number of genes per cell
+```{r}
+outliers=c()
+for ( i in unique(seur$sample)){
+  outliers=c(outliers, 
+             scater::isOutlier(seur$nFeature_RNA[seur$sample==i], nmads=3, type="lower", log=TRUE)
+             )
+}
+seur$nGene.outlier.low <- outliers[colnames(seur)]
+cat("Outliers:",sum(seur$nGene.outlier.low))
+```
+Create histograms
+```{r , fig.height = 3.5, fig.width = 10}
+for ( i in unique(seur$sample)){
+  hist(seur$nFeature_RNA[seur$sample==i],
+        breaks = 100,xlab="nCount_RNA",
+        main=paste0("Number of genes per cell: ",i))
+  if(sum(seur$sample==i & seur$nGene.outlier.low)!=0)
+    abline(v = max(seur$nFeature_RNA[seur$sample==i & seur$nGene.outlier.low]), col = "red")
+}
+```
+Create violin plots 
+```{r , fig.height = 3.5, fig.width = 10}
+for ( i in unique(seur$sample)){
+ print(ggplot(as.data.frame(seur[[]])[seur$sample==i,], aes(1, nFeature_RNA)) + 
+    geom_violin(fill="gray80") +theme_classic()+ theme(axis.title.x = element_blank())+
+    geom_jitter(height = 0, width = 0.3, aes(col=nGene.outlier.low)) +
+    scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("Number of genes per cell: ",i)))
+}
+```
+
+#### - Proportion of mitohondrial genes per cell
+```{r}
+outliers=c()
+for ( i in unique(seur$sample)){
+  outliers=c(outliers, 
+             scater::isOutlier(seur$perc.mito[seur$sample==i], nmads=3, type="higher", log=TRUE)
+             )
+}
+seur$mito.outlier.high <- outliers[colnames(seur)]
+cat("Outliers:",sum(seur$mito.outlier.high))
+```
+Create histograms
+```{r , fig.height = 3.5, fig.width = 10}
+for ( i in unique(seur$sample)){
+  hist(seur$perc.mito[seur$sample==i],
+        breaks = 100,xlab="perc.mito",
+        main=paste0("% mito genes per cell: ",i))
+  if(sum(seur$sample==i & seur$mito.outlier.high)!=0)
+    abline(v = min(seur$perc.mito[seur$sample==i & seur$mito.outlier.high]), col = "red")
+}
+```
+Create violin plots 
+```{r , fig.height = 3.5, fig.width = 10}
+for ( i in unique(seur$sample)){
+ print(ggplot(as.data.frame(seur[[]])[seur$sample==i,], aes(1, perc.mito)) + 
+    geom_violin(fill="gray80") +theme_classic()+ theme(axis.title.x = element_blank())+
+    geom_jitter(height = 0, width = 0.3, aes(col=mito.outlier.high)) +
+    scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("% mito genes per cell: ",i)))
+}
+```
+
+
+
+#### Overlap of cells, outliers for UMI counts, number of genes and % mitochodrial genes per cell
+A large nuber of cells, outliers specifically for one QC metric might be a concern and require fuurhter investigation
+```{r , fig.height = 3.5, fig.width = 6}
+for ( i in unique(seur$sample)){
+v <-venn.diagram(
+  list (nUMI=colnames(seur)[seur$nUMI.outlier.low & seur$sample==i],
+        nGene=colnames(seur)[seur$nGene.outlier.low & seur$sample==i],
+    perc.mito=colnames(seur)[seur$mito.outlier.high & seur$sample==i]),
+  filename=NULL,main=i,
+  alpha = c( 0.5,0.5,0.5),
+  fill = c("green","orange","blue")
+)
+grid.newpage()
+grid.draw(v)
+rm(v)
+}
+```
+
+
+#### How many cells will be removed during the filtering
+```{r,warning=FALSE}
+cells.to.keep= ! (seur$mito.outlier.high | seur$nGene.outlier.low | seur$nUMI.outlier.low)
+print(paste(ncol(seur)- 
+            ncol(seur[,cells.to.keep]),
+     "cells to be removed"))
+```
+
+#### Violin plots after filtering
+```{r , fig.height = 3.5, fig.width = 8}
+for ( i in unique(seur$sample)){
+  print(ggplot(as.data.frame(seur[[]][cells.to.keep& seur$sample==i, ]), aes(1, nCount_RNA)) + 
+   geom_violin(fill="gray80") + theme_classic()+ theme(axis.title.x = element_blank())+
+   geom_jitter(height = 0, width = 0.3, aes(col=nUMI.outlier.low)) +
+   scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("Total UMI counts per cell: ",i)))
+}
+for ( i in unique(seur$sample)){
+  print(ggplot(as.data.frame(seur[[]][ cells.to.keep& seur$sample==i, ]), aes(1, nFeature_RNA)) + 
+   geom_violin(fill="gray80") + theme_classic()+ theme(axis.title.x = element_blank())+
+   geom_jitter(height = 0, width = 0.3, aes(col=nGene.outlier.low)) +
+   scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("Number of genes per cell: ",i)))
+}
+for ( i in unique(seur$sample)){
+  print(ggplot(as.data.frame(seur[[]][cells.to.keep& seur$sample==i, ]), aes(1, perc.mito)) + 
+   geom_violin(fill="gray80") + theme_classic()+ theme(axis.title.x = element_blank())+
+   geom_jitter(height = 0, width = 0.3, aes(col=mito.outlier.high)) +
+   scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("% mito genes per cell: ",i)))
+}
+```
+
+#### Filter the outlier cells
+```{r}
+  seur_clean<-seur[, cells.to.keep]
+  print(dim(seur))
+  print(dim(seur_clean))
+```
+
+
+#### 2.2) Get PCA outliers (Optional)
+Get additional outliers, using multivariate outlier detection function of scater, based on PCA computed on QC metric data (uses the mvoutlier package)
+
+```{r}
+sce=as.SingleCellExperiment(seur_clean)
+##### Choose QC variables for authomatic outlier detection
+selected_variables <- c("nCount_RNA", 
+                        "nFeature_RNA", "perc.mito")
+setdiff(selected_variables, colnames(colData(sce))) ### check if any of the selected QC metrics are not present in the metadata
+```
+##### Detect outliers
+```{r}
+outliers=c()
+for ( i in unique(seur$sample)){
+sce_sample=runColDataPCA(sce[,sce$sample==i], outliers=T, variables=selected_variables)
+outliers=c(outliers,sce_sample$outlier)
+}
+```
+```{r}
+sce$outliers=outliers
+seur_clean <- AddMetaData(object = seur_clean, metadata = colData(sce)[colnames(seur_clean),"outliers"], col.name = "pca.outlier")
+cat("Outliers:",sum(seur_clean$pca.outlier))
+```
+```{r , fig.height = 3.5, fig.width = 10}
+for ( i in unique(seur$sample)){
+print(ggplot(as.data.frame(colData(sce)[sce$sample==i,]), aes(1, nCount_RNA)) + 
+  geom_violin(fill="gray80") + theme_classic()+ theme(axis.title.x = element_blank())+
+  geom_jitter(height = 0, width = 0.3, aes(col=outliers)) +
+  scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("Total UMI counts per cell: ",i)))
+}
+for ( i in unique(seur$sample)){
+print(ggplot(as.data.frame(colData(sce)[sce$sample==i,]), aes(1, nFeature_RNA)) + 
+  geom_violin(fill="gray80") + theme_classic()+ theme(axis.title.x = element_blank())+
+  geom_jitter(height = 0, width = 0.3, aes(col=outliers)) +
+  scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("Number of genes per cell: ",i)))
+}
+  for ( i in unique(seur$sample)){
+print(ggplot(as.data.frame(colData(sce)[sce$sample==i,]), aes(1, perc.mito)) + 
+  geom_violin(fill="gray80") + theme_classic()+ theme(axis.title.x = element_blank())+
+  geom_jitter(height = 0, width = 0.3, aes(col=outliers)) +
+  scale_color_manual(values=c("#00BFC4", "#F8766D"))+ggtitle(paste0("% mito genes per cell: ",i)))
+  }
+```
+
+##### As the number of additional PCA outliers is large, we keep those cells for now and will consider later if they need to be removed or not
+```{r}
+### Remove the PCA outlier cells
+# seur_clean<-seur_clean[, cells.to.keep]
+# print(dim(seur_clean))
+```
+
+### 3) QC: GENES
+To define a cutoff of lowly-abundant genes, we plot the distribution of log-means across all genes. The cutoff is placed in middle of the rectangular component of the graph before the peak.
+
+```{r , fig.height = 4, fig.width = 10}
+thresholds<-c(0.005,0.005)
+ave.counts=list()
+for ( i in 1: length(unique(seur_clean$sample))) {
+   ave.counts[[i]] <- rowMeans(as.matrix(GetAssayData(seur_clean, slot="counts")[,seur_clean$sample==unique(seur$sample)[i]]))
+  hist(log10(ave.counts[[i]]), breaks=100, main=paste0("Histogram of mean UMI counts per gene: ",unique(seur$sample)[i]), col="grey80",
+     xlab=expression(Log[10]~"mean count per gene"))
+  abline(v=log10(thresholds[i]), col="blue", lwd=2, lty=2)
+}
+```
+
+Number of genes to keep
+```{r,warning=FALSE, echo=FALSE}
+usegenes=list()
+for ( i in 1: length(unique(seur_clean$sample))) {
+    print(unique(seur$sample)[i])
+    usegenes[[i]]<-ave.counts[[i]]>thresholds[i]
+    print(table(usegenes[[i]]))
+}
+```
+
+##### Filter out the lowly-abundant genes that overlap between all samples
+```{r}
+i=1
+genes.filter=names(usegenes[[i]][! usegenes[[i]]])
+for ( i in 2: length(unique(seur_clean$sample))) {
+  genes.filter=intersect(genes.filter, names(usegenes[[i]][! usegenes[[i]]]))
+}
+usegenes.final=!rownames(seur_clean) %in% genes.filter
+table(usegenes.final)
+```
+```{r}
+seur_clean<-seur_clean[usegenes.final, ]
+```
+
+### 4) CALCULATE DOUBLET SCORE
+We estimate doublet score per cell, using the scDblFinder package,which simulates artificial doublets from cell clusters.
+It is preferable to look for doublets separately for each sample
+```{r}
+doublet.score<- scDblFinder::scDblFinder(as.SingleCellExperiment(seur_clean), samples="sample", BPPARAM=
+BiocParallel::MulticoreParam(3),returnType="table") ### Using 3 cores
+seur_clean <- AddMetaData(object = seur_clean, metadata = doublet.score[colnames(seur_clean),"score"], col.name = "doublet.score")
+seur_clean <- AddMetaData(object = seur_clean, metadata = doublet.score[colnames(seur_clean),"class"], col.name = "doublet.class")
+```
+```{r }
+table(seur_clean$doublet.class)
+```
+```{r }
+summary(seur_clean$doublet.score)
+```
+
+### 5) NORMALIZATION, HVG DETECTION and PCA
+```{r}
+##### Normalize data
+seur_clean <- NormalizeData(seur_clean,verbose = F)
+##### HVG detection 
+seur_clean <- FindVariableFeatures(seur_clean,verbose=F)
+##### Scale data per gene
+seur_clean <- ScaleData(seur_clean,verbose=F)
+##### PCA
+seur_clean <- RunPCA(seur_clean, features =VariableFeatures(seur_clean) ,verbose=F)
+```
+#### Select PCs for downstream analysis of the dataset
+Seurat provides a heuristic method to help us select PC components. It generates a ranking of PCs based on the percentage of variance explained by each of them 
+```{r , fig.height = 4, fig.width = 6,warning=FALSE}
+ElbowPlot(object = seur_clean,ndims =50)
+```
+Heatmap of the genes that drive each PC
+```{r , fig.height = 15, fig.width = 12,warning=FALSE}
+DimHeatmap(seur_clean, dims = 1:30, cells = 5000, balanced = TRUE)
+```
+
+### 6) UMAP DIMENSIONALITY REDUCTION
+Run Uniform Manifold Approximation and Projection (UMAP) dimensional reduction technique for visualisation of the data
+
+```{r}
+### PC selection for downstream analysis
+dims.use<-30
+```
+
+```{r,warning=FALSE}
+seur_clean <- RunUMAP(seur_clean, dims = 1:dims.use, verbose=F)
+```
+
+Visualise the UMAP plot, coloured by sample to check for batch effects
+```{r , fig.height = 6, fig.width = 7}
+DimPlot(object = seur_clean, group.by = "sample",label=T, repel=T)
+```
+```{r , fig.height = 6, fig.width = 7}
+FeaturePlot(object = seur_clean, features = c("Ly6c2", "Ccr2"), split.by = "sample" )
+```
+The UMAP plot shows relatively good mixing by sample for most cells. Logically, monocytes are mainly present in Ccr2 WT cells, as visualized by Ccr2 and Ly6c2 expression.
+
+### 7) BATCH CORRECTION 
+In case batch correction is necessary, it can be performed using the harmony package. Select a value for theta - diversity clustering penalty parameter (Default theta=2). Larger values of theta result in stronger integration, but can lead to over-correction)
+```{r , fig.height = 4, fig.width = 4}
+theta.use<-1 # Here the theta parameter can be modified
+seur_clean<-RunHarmony(seur_clean, group.by.vars="sample",theta =theta.use,  
+                       plot_convergence = TRUE, reduction.save =paste0("harmonyTheta",theta.use),
+                       reduction.key = paste0("harmonyTheta",theta.use,"_"), verbose=F) 
+seur_clean <- RunUMAP(seur_clean,reduction =paste0("harmonyTheta",theta.use), 
+                      dims = 1:dims.use,verbose =F,   reduction.name = paste0("umapHarmonyTheta",theta.use, "PC",dims.use), 
+                      reduction.key = paste0("umapHarmonyTheta",theta.use, "PC",dims.use,"_"))  
+```
+
+```{r , fig.height = 6, fig.width = 7}
+### Visualise the harmony-corrected UMAP plot, coloured by sample to inspect if the batch effects were resolved
+ DimPlot(object = seur_clean,reduction = paste0("umapHarmonyTheta",theta.use, "PC",dims.use), 
+         group.by = "sample",label=T, repel=T)+ggtitle(paste0("Samples: UMAP Harmony theta= ",theta.use, " PC= ",dims.use))
+```
+As the the samples already show good mixing before batch correction, and the library preparation was done on the same day for both samples, we are going to continue without batch correction
+
+
+#### Visualize QC metrics
+```{r , fig.height =8, fig.width = 10,warning=FALSE}
+FeaturePlot(object = seur_clean,
+            features = c("nCount_RNA", "nFeature_RNA", "perc.mito","doublet.score"))
+```
+Visualize PCA outlier cells
+```{r , fig.height = 4, fig.width =5,warning=FALSE}
+DimPlot(object = seur_clean, group.by = "pca.outlier") 
+```
+#### Visualize QC metrics for pca outliers, and the remaining cells
+```{r , fig.height =10, fig.width =7,warning=FALSE}
+FeaturePlot(seur_clean, split.by ="pca.outlier" ,features=c("nCount_RNA", "nFeature_RNA", "perc.mito", "Mki67","Stmn1"), 
+keep.scale="feature", pt.size = 0.2)
+```
+The PCA outliers include cells with high percent mitochondrial genes, as well as cells with high UMI content and number of genes. Many of the latter express proliferation markers (Mki67, Stmn1), the active proliferation explaining their higher number of UMIs and genes. Therefore the PCA outliers will not be removed.
+
+
+
+### 8) CLUSTERING
+We run Louvain clustering with varying the clustering resolution between 0 and 2
+```{r}
+seur_clean <- FindNeighbors(seur_clean, dims = 1:dims.use, 
+                      graph.name = paste0("RNA_snn_PC",dims.use), verbose=F)
+for ( i in seq(0,2, 0.25))
+  seur_clean <- FindClusters(seur_clean, resolution = i, graph.name=paste0("RNA_snn_PC",dims.use), verbose=F)
+```
+
+If the batch correction is necessary for a specific dataset, clustering can be performed on the harmony-corrected PCA embeddings:
+```{r}
+#seur_clean <- FindNeighbors(seur_clean, dims = 1:dims.use, reduction =paste0("harmonyTheta",theta.use), graph.name = paste0("RNA_snn_harmony_theta",theta.use, ".PC",dims.use), verbose=F)
+#for ( i in seq(0,2, 0.25))
+#  seur_clean <- FindClusters(seur_clean, resolution = i, graph.name=paste0("RNA_snn_harmony_theta",theta.use, ".PC",dims.use), verbose=F)
+```
+
+#### Choosing a clustering resolution value
+Plot of a clustering tree showing the relationship between clustering at different resolution (using the clustree package).This plot allows us to see how are the clusters related to each other and which ones are stable across different resolutions
+```{r , fig.height = 8, fig.width = 10}
+clustree(seur_clean, prefix = paste0("RNA_snn_PC",dims.use,"_res."))+
+  ggtitle(paste("PC =",dims.use))
+```
+The clusters are relatively stable until resolution of 1
+
+#### Visualize the clusters for several resolution values on the UMAP plot
+```{r , fig.height = 8, fig.width = 12}
+plot<-list()
+for ( res in c(0.25,0.5, 0.75,1))
+  plot[[as.character(res)]]<-DimPlot(seur_clean,label=T,repel=T, group.by = paste0("RNA_snn_PC",dims.use,"_res.",res))+
+                                      ggtitle(paste("PC =",dims.use,"res=",res))
+plot_grid(plotlist=plot)
+```
+
+###  9) ANNOTATING THE CLUSTERS
+Let's find differentially expressed (DE) genes per cluster for resolution=1. 
+```{r}
+res=1
+Idents(seur_clean)=  paste0("RNA_snn_PC",dims.use,"_res.",res)
+Idents(seur_clean)=  factor(Idents(seur_clean),levels = 0:(length(unique(Idents(seur_clean)))-1))
+DEgenes<-FindAllMarkers(seur_clean,min.cells.group=2,pseudocount.use = 0.01, max.cells.per.ident = 1000,verbose = F) ## By using a smaller pseudocount.use than the default of 1, the avglogFC values correspond more closely to the actual log fold changes, and less weight is given to higher expressed genes versus lowly expressed ones.
+```
+
+#### Next,we visualise the expression of the top marker genes for each cluster in a heatmap
+```{r}
+features.plot=DEgenes%>%filter(avg_logFC>0)%>% group_by(cluster)%>%top_n(n=-3,wt=p_val_adj)%>%pull(gene) ### top 3 markers
+length(features.plot)
+```
+```{r}
+seur_clean=ScaleData(seur_clean, features = rownames(seur_clean)) ### Scale the data for all genes to be able to visualise their expression with DoHeatmap
+```
+```{r , fig.height =12, fig.width =12}
+DoHeatmap(seur_clean, features = features.plot, assay = "RNA", angle = 90, label =T, size=4) +
+  scale_fill_gradient2(low = "blue", mid = "white",high = "red")+
+  theme(legend.position = "bottom")
+```
+
+
+
+#### Check the distribution of each cluster per sample
+```{r , fig.height = 3, fig.width = 8,warning=FALSE}
+data<-as.data.frame(table(seur_clean$sample, Idents(seur_clean)))
+colnames(data)=c("sample","cluster","Freq")
+ggplot(data, aes(x=cluster, y=Freq, fill=sample))+geom_bar(stat = "identity")+ggtitle(paste0("Number of cells per cluster (resolution =",res,")"))+theme_classic()
+```
+
+#### Visualise the expression of marker genes on a UMAP plot
+```{r , fig.height = 15, fig.width =11,warning=FALSE}
+FeaturePlot(seur_clean,features=c("Ccr2","Ly6c2","C1qa","Sparc","P2ry12","Tgfbi","Ms4a7","Mki67","Gata2","Hdc","Cpa3","S100a9","Csf3r","Flt3","Xcr1","Cd209a","H2-DMb2","Ccr7","Ccr9","Ms4a1","Jchain", "Cd3e","Cd8a","Cd4","Foxp3","Klrb1c","Sox2","Plp1"))
+```
+```{r }
+seur_clean$nCount_RNA_log=log2(seur_clean$nCount_RNA)
+seur_clean$nFeature_RNA_log=log2(seur_clean$nFeature_RNA)
+```
+
+#### Visualise the expression of marker genes using a DotPlot
+```{r , fig.height = 6, fig.width =13,warning=FALSE}
+DotPlot(seur_clean,features=c("Ptprc","Ccr2","Ly6c2","Plac8","C1qa","Sparc","Sall1","Tgfbi","Ms4a7","Mki67","Stmn1","Mcm3","Ifit3","Ly6g","Csf3r","S100a9","S100a8","Flt3","Xcr1","Cd209a","H2-DMb2","Napsa","Siglech","Ccr9","Ccr7","Cacnb3","Ccl22", "Cd3e","Cd8a","Cd4","Lef1","Tcf7","Foxp3","Il2ra","Tcrg-C1","Trdc","Klrb1c","Ncr1","Gnly", "Cd19","Ms4a1","Sdc1","Jchain","Ms4a2", "Gata2","Cd200r3","Cdh1","Hgf","Hdc","Mcpt1","Cpa3","Sox2","Gjc3","Plp1", "doublet.score","perc.mito","nCount_RNA_log","nFeature_RNA_log"))+RotatedAxis()
+```
+
+#### Assign cell types to the clusters, based on the marker gene expression
+```{r,warning=FALSE}
+Idents(seur_clean) <- plyr::mapvalues(x = Idents(seur_clean), from = 0:25, 
+     to =c("TAM 1","CD8 T cells","TAM 2","TAM 3","TAM 4","Artefact","NK cells","cDC2","Basophils","Treg cells","TAM Proliferating","migDC","Monocytes","cDC1","T cells Proliferating","CD4 T cells 1","pDC","CD4 T cells 2","TAM 5","Plasma cells","B cells","TAM/T doublets","Mast cells","Neutrophils","Oligodendrocytes","TAM/Basophil doublets"))
+```
+```{r , fig.height = 8, fig.width = 12,warning=FALSE}
+DimPlot(seur_clean,repel =T,label=T) 
+```
+
+```{r , fig.height = 6, fig.width =14,warning=FALSE}
+DotPlot(seur_clean,features=c("Ptprc","Ccr2","Ly6c2","Plac8","C1qa","Sparc","Sall1","Tgfbi","Ms4a7","Mki67","Stmn1","Mcm3","Ifit3","Ly6g","Csf3r","S100a9","S100a8","Flt3","Xcr1","Cd209a","H2-DMb2","Napsa","Siglech","Ccr9","Ccr7","Cacnb3","Ccl22", "Cd3e","Cd8a","Cd4","Lef1","Tcf7","Foxp3","Il2ra","Tcrg-C1","Trdc","Klrb1c","Ncr1","Gnly", "Cd19","Ms4a1","Sdc1","Jchain","Ms4a2", "Gata2","Cd200r3","Cdh1","Hgf","Hdc","Mcpt1","Cpa3","Sox2","Gjc3","Plp1", "doublet.score","perc.mito","nCount_RNA_log","nFeature_RNA_log"))+RotatedAxis()
+```
+
+###  10) REMOVE DOUBLETS AND ARTEFACTS
+Remove the doublets and artefacts  - cluster with high mitochodrial content and the oligodendrocytes as the latter are probably dues to impurities during the CD45+ sorting
+
+
+```{r , fig.height = 5, fig.width = 8,warning=FALSE}
+data<-as.data.frame(table(seur_clean$doublet.class, Idents(seur_clean)))
+colnames(data)=c("doublet.class","cluster","Freq")
+ggplot(data, aes(x=cluster, y=Freq, fill=doublet.class))+geom_bar(stat = "identity")+ggtitle(paste0("Number of cells per cluster (resolution =",res,")"))+theme_classic()+RotatedAxis()
+```
+```{r}
+cells.keep=WhichCells(seur_clean, idents =c("Artefact","TAM/T doublets","TAM/Basophil doublets","Oligodendrocytes"), invert = T )
+cat(ncol(seur_clean)-length(cells.keep),"cells to be removed")
+```
+Remove cells and rerun HVG detection,PCA and UMAP
+```{r}
+seur_artefacts_removed=seur_clean[,cells.keep]
+seur_artefacts_removed <- FindVariableFeatures(seur_artefacts_removed,verbose=F)
+seur_artefacts_removed <- ScaleData(seur_artefacts_removed,verbose=F)
+seur_artefacts_removed <- RunPCA(seur_artefacts_removed, features =VariableFeatures(seur_artefacts_removed) ,verbose=F)
+```
+
+```{r , fig.height = 4, fig.width = 6,warning=FALSE}
+#### Select PCs for downstream analysis of the dataset
+ElbowPlot(object = seur_artefacts_removed,ndims =50)
+```
+Heatmap of the genes that drive each PC
+```{r , fig.height = 15, fig.width = 12,warning=FALSE}
+DimHeatmap(seur_artefacts_removed, dims = 1:30, cells = 5000, balanced = TRUE)
+```
+
+Run UMAP
+```{r , fig.height = 4, fig.width = 4}
+dims.use<-30 ### Final PC selection for downstream analysis
+seur_artefacts_removed <- RunUMAP(seur_artefacts_removed, dims = 1:dims.use, verbose=F)
+```
+
+
+```{r , fig.height = 6, fig.width = 7}
+DimPlot(object = seur_artefacts_removed, group.by = "sample",label=T, repel=T)+
+  ggtitle(paste0("Samples: UMAP PC= ",dims.use))
+```
+
+#### Explore DE genes between cluster TAM5 and TAM1 through Volcano plot
+```{r , fig.height = 3, fig.width = 8}
+contrast.name="TAM5vsTAM1"
+DEG_TAM5vsTAM1=FindMarkers(seur_artefacts_removed,ident.1 = "TAM 5",ident.2 = "TAM 1",
+                           pseudocount.use = 0.01, verbose = F)
+DEG_TAM5vsTAM1$gene=rownames(DEG_TAM5vsTAM1)
+```
+```{r , fig.height = 3, fig.width = 8}
+ggplot(data=DEG_TAM5vsTAM1, aes(x= avg_logFC, y = -log10(p_val_adj))) +
+    geom_point(alpha = 1, size=2, 
+               aes(col = p_val_adj<1e-20 & (avg_logFC>1 | avg_logFC< -1))) +
+    scale_color_manual(values = c("dark grey", "brown1")) +
+    geom_text_repel(data=subset(DEG_TAM5vsTAM1,  
+                    p_val_adj<1e-100 & (avg_logFC>1 | avg_logFC< -1)),aes(label = gene), size =4)+
+    theme_classic()+theme(legend.position = "none")+ggtitle(contrast.name)
+```
+
+### Gene Ontology enrichment with Metascape of the genes upregulated in cluster TAM5 compared to cluster TAM1
+Select top upregulated DEG (as those genes are specific for the cluster of interest). It is best to have at least 20-50 genes for GO enrichment.
+```{r}
+p_tresh=1e-20
+logFC_thresh=1
+selected.genes=DEG_TAM5vsTAM1[DEG_TAM5vsTAM1$p_val_adj<p_tresh & DEG_TAM5vsTAM1$avg_logFC>logFC_thresh,"gene"]
+length(selected.genes)
+```
+Export gene names as a csv file for metascape
+```{r}
+write.table(selected.genes, file=paste0("Upregulated_genes_",contrast.name,"_p_val_adj.",p_tresh,"_logFC.",logFC_thresh,".csv"), row.names = F, col.names = F, sep=",")
+```
+###### Run GO enrichment in Metascape (https://metascape.org/):
+###### Input the .csv file and do Express analysis with "Input as"= M.musculus and "analysis as"= M.musculus => Express Analysis. Save the "Gene List Report Excel Sheets"
+#####  Visualization of the enriched pathways on the Volcano plot:
+
+```{r}
+GO.metascape=xlsx::read.xlsx( paste0("Metascape_Upregulated_genes_",contrast.name,"_p_val_adj.",p_tresh,"_logFC.",logFC_thresh,".xlsx"),2 )
+#Select only the main (summary) pathways
+GO.metascape$group=sapply(strsplit(GO.metascape$GroupID, "_"), "[[",2)
+```
+
+### Top GO enriched pathway:
+```{r , fig.height =4, fig.width = 10 ,warning=FALSE}
+index=1
+gset.symbols=GO.metascape[index,"Symbols"]
+gset.symbols=strsplit(gset.symbols, ",")[[1]]
+GOterm=GO.metascape[index,"Description"]
+ggplot(data=DEG_TAM5vsTAM1, aes(x= avg_logFC, y = -log10(p_val_adj))) +
+    geom_point(alpha = 1, size=2,
+               aes(color=gene %in% gset.symbols)) +
+    scale_color_manual(values = c("dark grey", "brown1")) +
+    geom_text_repel(data=subset(DEG_TAM5vsTAM1,  
+                   gene %in% gset.symbols),aes(label = gene), size =4)+
+    theme_classic()+theme(legend.position = "none")+ggtitle(paste0( contrast.name, ": ", GOterm, " pathway"))
+```
+
+### "response to hypoxia" pathway:
+```{r , fig.height =4, fig.width = 10 ,warning=FALSE}
+GOterm="response to hypoxia"
+gset.symbols=GO.metascape[GO.metascape$Description==GOterm,"Symbols"]
+gset.symbols=strsplit(gset.symbols, ",")[[1]]
+ggplot(data=DEG_TAM5vsTAM1, aes(x= avg_logFC, y = -log10(p_val_adj))) +
+    geom_point(alpha = 1, size=2,
+               aes(color=gene %in% gset.symbols)) +
+    scale_color_manual(values = c("dark grey", "brown1")) +
+    geom_text_repel(data=subset(DEG_TAM5vsTAM1,  
+                   gene %in% gset.symbols),aes(label = gene), size =4)+
+    theme_classic()+theme(legend.position = "none")+ggtitle(paste0( contrast.name, ": ", GOterm, " pathway"))
+```
+
+
+```{r , fig.height = 6, fig.width = 10}
+DimPlot(object = seur_artefacts_removed,label=T, repel=T)+
+  ggtitle(paste0("Cell annotation: UMAP PC= ",dims.use))
+```
+
+##### Save object
+```{r}
+saveRDS(seur_artefacts_removed, file="Citeseq_mouse_GBM.seuratObj.rds")
+```
+
+```{r,warning=FALSE}
+sessionInfo()
+```
+
+
